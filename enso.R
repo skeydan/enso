@@ -44,22 +44,22 @@ grb <-
 #   theme(legend.key.width = unit(2, "cm"))
 
 
-grb_train <- grb %>% filter(time < as.Date("2000-01-01"))
-grb_train <- as.tbl_cube.stars(grb_train)$mets[[1]] 
-grb_train <- grb_train + 273.15
-quantile(grb_train, na.rm = TRUE)
-train_mean <- mean(grb_train, na.rm = TRUE)
-train_sd <- sd(grb_train, na.rm = TRUE)
-grb_train <- (grb_train - train_mean) / train_sd
-grb_train[is.na(grb_train)] <- 0
-quantile(grb_train, na.rm = TRUE)
+sst_train <- grb %>% filter(time < as.Date("2000-01-01"))
+sst_train <- as.tbl_cube.stars(sst_train)$mets[[1]] 
+sst_train <- sst_train + 273.15
+quantile(sst_train, na.rm = TRUE)
+train_mean <- mean(sst_train, na.rm = TRUE)
+train_sd <- sd(sst_train, na.rm = TRUE)
+sst_train <- (sst_train - train_mean) / train_sd
+sst_train[is.na(sst_train)] <- 0
+quantile(sst_train, na.rm = TRUE)
   
-grb_valid <- grb %>% filter(time >= as.Date("2000-01-01"))
-grb_valid <- as.tbl_cube.stars(grb_valid)$mets[[1]] 
-grb_valid <- grb_valid + 273.15
-grb_valid <- (grb_valid - train_mean) / train_sd
-quantile(grb_valid, na.rm = TRUE)
-grb_valid[is.na(grb_valid)] <- 0
+sst_valid <- grb %>% filter(time >= as.Date("2000-01-01"))
+sst_valid <- as.tbl_cube.stars(sst_valid)$mets[[1]] 
+sst_valid <- sst_valid + 273.15
+sst_valid <- (sst_valid - train_mean) / train_sd
+quantile(sst_valid, na.rm = TRUE)
+sst_valid[is.na(sst_valid)] <- 0
 
 
 nino <- read_table2("ONI_NINO34_1854-2020.txt", skip = 9) %>%
@@ -71,9 +71,19 @@ nrow(nino)
 nino_train <- nino %>% filter(month < as.Date("2000-01-01"))
 nino_valid <- nino %>% filter(month >= as.Date("2000-01-01"))
 
+train_mean_nino <- mean(nino_train$NINO34_MEAN)
+train_sd_nino <- sd(nino_train$NINO34_MEAN)
+# nino_train <- nino_train %>% mutate(
+#   NINO34_MEAN = scale(NINO34_MEAN, center = train_mean_nino, scale = train_sd_nino) 
+# )
+# nino_valid <- nino_valid %>% mutate(
+#   NINO34_MEAN = scale(NINO34_MEAN, center = train_mean_nino, scale = train_sd_nino) 
+# )
+
+
 #ggplot(nino %>% filter(PHASE != "M"), aes(x = month, y = NINO34_MEAN, color = PHASE)) + geom_path(size = 0.5)
 
-grb_valid %>% dim()
+sst_valid %>% dim()
 nino_valid %>% dim()
 
 n_timesteps <- 6
@@ -83,33 +93,35 @@ enso_dataset <- dataset(
   
   name = "enso_dataset",
   
-  initialize = function(sst, nino34, n_timesteps) {
-   self$x <- sst
-   self$y <- nino34
+  initialize = function(sst, nino, n_timesteps) {
+   self$sst <- sst
+   self$nino <- nino
    self$n_timesteps <- n_timesteps
   },
   
   .getitem = function(i) {
-    x <- torch_tensor(self$x[ , , i:(n_timesteps + i - 1)]) # (360, 180, n_timesteps)
+    x <- torch_tensor(self$sst[ , , i:(n_timesteps + i - 1)]) # (360, 180, n_timesteps)
     x <- torch_split(x, 1, dim = 3) # list of length n_timesteps of tensors (360, 180, 1)
     x <- torch_stack(x) # (n_timesteps, 360, 180, 1)
     x <- x$view(c(n_timesteps, 1, 360, 180))
     
-    y <- torch_tensor(self$y$NINO34_MEAN[(i + 1):(n_timesteps + i)])
-    list(x = x, y = y)
+    y1 <- torch_tensor(self$sst[ , , n_timesteps + i])$unsqueeze(1) # (1, 360, 180)
+    y2 <- torch_tensor(self$nino$NINO34_MEAN[n_timesteps + i])
+    list(x = x, y1 = y1, y2 = y2)
   },
   
   .length = function() {
-    nrow(self$y) - n_timesteps 
+    nrow(self$nino) - n_timesteps 
   }
   
 )
 
-valid_ds <- enso_dataset(grb_valid, nino_valid, n_timesteps)
+valid_ds <- enso_dataset(sst_valid, nino_valid, n_timesteps)
 length(valid_ds)
 first <- valid_ds$.getitem(1)
-first$x
-first$y
+first$x # 6,1,360,180
+first$y1 # 1,360,180
+first$y2 # 1
 
 valid_dl <- valid_ds %>% dataloader(batch_size = batch_size)
 length(valid_dl)
@@ -118,7 +130,7 @@ iter <- valid_dl$.iter()
 first_batch <- iter$.next()
 #first_batch
 
-train_ds <-enso_dataset(grb_train, nino_train, n_timesteps)
+train_ds <-enso_dataset(sst_train, nino_train, n_timesteps)
 length(train_ds)
 train_dl <- train_ds %>% dataloader(batch_size = batch_size, shuffle = TRUE)
 length(train_dl)
@@ -141,15 +153,21 @@ model <- nn_module(
                               kernel_sizes = convlstm_kernel,
                               n_layers = convlstm_layers
                               )
-    self$output <- nn_linear(360 * 180, 1)
+    self$linear <- nn_linear(360 * 180 * n_timesteps, 128)
+    self$output <- nn_linear(128, 1)
     
   },
   
   forward = function(x) {
     
-    c(layer_outputs, layer_last_states) %<-% self$convlstm(x)
-    flat <- torch_flatten(layer_outputs[[self$n_layers]], start_dim = 3)$squeeze(2)
-    self$output(flat)$squeeze(3)
+    ret <- self$convlstm(x)
+    layer_outputs <- ret[[1]]
+    layer_last_states <- ret[[2]]
+    next_sst <- layer_last_states[[self$n_layers]][[1]]
+   
+    flat <- torch_flatten(layer_outputs[[self$n_layers]], start_dim = 2)
+    next_nino <- self$linear(flat) %>% nnf_relu() %>% self$output()
+    list(next_sst, next_nino)
     
   }
     
@@ -170,75 +188,126 @@ net <- net$to(device = device)
 
 optimizer <- optim_adam(net$parameters, lr = 0.001)
 
-num_epochs <- 20
+num_epochs <- 1
 
 train_batch <- function(b) {
   
-  print(i)
-  
   optimizer$zero_grad()
   output <- net(b$x$to(device = device))
-  target <- b$y$to(device = device)
   
-  loss <-  nnf_mse_loss(output, target)
+  sst_loss <- nnf_mse_loss(output[[1]], b$y1$to(device = device))
+  nino_loss <- nnf_mse_loss(output[[2]], b$y2$to(device = device))
   
-  if (i %% 200 == 0) {
-    print(as.matrix(output))
-    print(as.matrix(target))
-    print(loss$item())
+  if (i %% 40 == 0) {
+    print(i)
+    
+    print(sst_loss$item())
+    print(nino_loss$item())
+    
+    print(as.numeric(output[[2]]))
+    print(as.numeric(b$y2))
   }
   
   i <<- i + 1
   
+  loss <- sst_loss + nino_loss
   loss$backward()
   optimizer$step()
   
-  gc(full = TRUE)
-  
-  loss$item()
+  list(sst_loss$item(), nino_loss$item(), loss$item())
   
 }
 
 valid_batch <- function(b) {
   
   output <- net(b$x$to(device = device))
-  target <- b$y$to(device = device)
   
-  loss <-  nnf_mse_loss(output, target)
+  sst_loss <- nnf_mse_loss(output[[1]], b$y1$to(device = device))
+  nino_loss <- nnf_mse_loss(output[[2]], b$y2$to(device = device))
   
-  gc(full = TRUE)
-  
-  loss$item()
+  loss <- sst_loss + nino_loss
+
+  list(sst_loss$item(), nino_loss$item(), loss$item())
   
 }
 
 for (epoch in 1:num_epochs) {
   
   net$train()
+  train_loss_sst <- c()
+  train_loss_nino <- c()
   train_loss <- c()
   
-  i <- 1
+  i <<- 1
 
   for (b in enumerate(train_dl)) {
-    loss <- train_batch(b)
-    train_loss <- c(train_loss, loss)
+    
+    losses <- train_batch(b)
+    train_loss_sst <- c(train_loss_sst, losses[[1]])
+    train_loss_nino <- c(train_loss_nino, losses[[2]])
+    train_loss <- c(train_loss, losses[[3]])
+    
+    gc(full = TRUE)
   }
 
   torch_save(net, paste0("model_", epoch, ".pt"))
 
-  cat(sprintf("\nEpoch %d, training: loss:%3f\n", epoch, mean(train_loss)))
+  cat(sprintf("\nEpoch %d, training: loss: %3.3f sst: %3.3f nino: %3.3f \n",
+              epoch, mean(train_loss), mean(train_loss_sst), mean(train_loss_nino)))
+  
+  print(train_loss)
+  print(train_loss_sst)
+  print(train_loss_nino)
   
   net$eval()
+  valid_loss_sst <- c()
+  valid_loss_nino <- c()
   valid_loss <- c()
 
+  for (b in enumerate(valid_dl)) {
+    
+    losses <- valid_batch(b)
+    valid_loss_sst <- c(valid_loss_sst, losses[[1]])
+    valid_loss_nino <- c(valid_loss_nino, losses[[2]])
+    valid_loss <- c(valid_loss, losses[[3]])
+    
+    gc(full = TRUE)
+    
+  }
+  
+  cat(sprintf("\nEpoch %d, validation: loss: %3.3f sst: %3.3f nino: %3.3f \n",
+              epoch, mean(valid_loss), mean(valid_loss_sst), mean(valid_loss_nino)))
+  
+  print(valid_loss)
+  print(valid_loss_sst)
+  print(valid_loss_nino)
+  
+}
+
+
+
+# get predictions ---------------------------------------------------------
+
+recursive_predict <- function(n_advance) {
+  
+  net$eval()
+  
   for (b in enumerate(valid_dl)) {
     
     loss <- valid_batch(b)
     valid_loss <- c(valid_loss, loss)
     
+    input <- b$x
+    target <- b$y
+    
+    for (i in 1:n_advance) {
+      
+      preds <- net()
+      
+    }
+    
   }
   
-  cat(sprintf("\nEpoch %d, validation: loss:%3f\n", epoch, mean(valid_loss)))
 }
 
 
