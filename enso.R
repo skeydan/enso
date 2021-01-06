@@ -97,7 +97,7 @@ sst_valid %>% dim()
 nino_valid %>% dim()
 
 n_timesteps <- 6
-batch_size <- 4
+batch_size <- 8
 
 enso_dataset <- dataset(
   
@@ -206,11 +206,11 @@ net
 
 optimizer <- optim_adam(net$parameters, lr = 0.001)
 
-num_epochs <- 30
+num_epochs <- 50
 
-lw_sst <- 0
-lw_temp <- 0
-lw_nino <- 1
+lw_sst <- 0.33
+lw_temp <- 0.33
+lw_nino <- 0.33
 
 
 train_batch <- function(b) {
@@ -222,7 +222,8 @@ train_batch <- function(b) {
   temp_loss <- nnf_mse_loss(output[[2]], b$y2$to(device = device))
   nino_loss <- nnf_cross_entropy(output[[3]], b$y3$to(device = device))
   
-  if ((i %% 10 == 0) || (temp_loss$item() > 10)) {
+  if ((i %% 30 == 0)) {
+    
     print(i)
     
     print(sst_loss$item())
