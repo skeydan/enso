@@ -20,7 +20,7 @@ library(readr)
 library(dplyr)
 library(ggplot2)
 library(viridis)
-#library(ggthemes)
+library(ggthemes)
 
 #purrr::walk(readLines("files"), function(f) download.file(url = f, destfile = basename(f)))
 #read_stars("grb/sst189101.grb")
@@ -55,8 +55,9 @@ quantile(sst_train, na.rm = TRUE)
 train_mean <- mean(sst_train, na.rm = TRUE)
 train_sd <- sd(sst_train, na.rm = TRUE)
 sst_train <- (sst_train - train_mean) / train_sd
-sst_train[is.na(sst_train)] <- 0
 quantile(sst_train, na.rm = TRUE)
+sst_train[is.na(sst_train)] <- 0
+quantile(sst_train)
   
 sst_valid <- grb %>% filter(time >= as.Date("2000-01-01"))
 sst_valid <- as.tbl_cube.stars(sst_valid)$mets[[1]] 
@@ -65,6 +66,7 @@ sst_valid <- (sst_valid - train_mean) / train_sd
 quantile(sst_valid, na.rm = TRUE)
 sst_valid[is.na(sst_valid)] <- 0
 
+#sst_valid[,,1] %>% as.matrix() %>% image()
 
 nino <- read_table2("ONI_NINO34_1854-2020.txt", skip = 9) %>%
   mutate(month = as.Date(paste0(YEAR, "-", `MON/MMM`, "-01"))) %>%
@@ -140,7 +142,7 @@ length(valid_dl)
 
 iter <- valid_dl$.iter()
 first_batch <- iter$.next()
-#first_batch
+first_batch$y1
 
 train_ds <-enso_dataset(sst_train, nino_train, n_timesteps)
 length(train_ds)
@@ -166,9 +168,13 @@ model <- nn_module(
                               kernel_sizes = convlstm_kernel,
                               n_layers = convlstm_layers
                               )
-    self$linear <- nn_linear(360 * 180, 128)
-    self$cont <- nn_linear(128, 128)
-    self$cat <- nn_linear(128, 128)
+    self$conv1 <- nn_conv2d(in_channels = 1, out_channels = 32, kernel_size = 3, stride = 2)
+    self$conv2 <- nn_conv2d(in_channels = 32, out_channels = 64, kernel_size = 3, stride = 2)
+    self$conv3 <- nn_conv2d(in_channels = 64, out_channels = 1, kernel_size = 3, stride = 2)
+    
+    self$linear <- nn_linear(44 * 21, 64)
+    self$cont <- nn_linear(64, 128)
+    self$cat <- nn_linear(64, 128)
     self$cont_output <- nn_linear(128, 1)
     self$cat_output <- nn_linear(128, 3)
     
@@ -178,9 +184,15 @@ model <- nn_module(
     
     ret <- self$convlstm(x)
     layer_last_states <- ret[[2]]
+    #last_layer_output <- ret[[1]][[self$n_layers]]$permute(c(1, 3, 2, 4, 5))
+    
     next_sst <- layer_last_states[[self$n_layers]][[1]]
+    
+    filtered_1 <- self$conv1(next_sst) 
+    filtered_2 <- self$conv2(filtered_1)
+    filtered_3 <- self$conv3(filtered_2) 
    
-    flat <- torch_flatten(next_sst, start_dim = 2)
+    flat <- torch_flatten(filtered_3, start_dim = 2)
     common <- self$linear(flat) %>% nnf_relu()
     
     next_temp <- common %>% self$cont() %>% nnf_relu() %>% self$cont_output()
@@ -208,33 +220,36 @@ optimizer <- optim_adam(net$parameters, lr = 0.001)
 
 num_epochs <- 50
 
-lw_sst <- 0.33
-lw_temp <- 0.33
-lw_nino <- 0.33
+lw_sst <- 0.5
+lw_temp <- 0.5
+lw_nino <- 0
 
 
 train_batch <- function(b) {
   
   optimizer$zero_grad()
   output <- net(b$x$to(device = device))
+  
+  sst_output <- output[[1]]
+  sst_target <- b$y1$to(device = device)
 
-  sst_loss <- nnf_mse_loss(output[[1]], b$y1$to(device = device))
+  sst_loss <- nnf_mse_loss(sst_output[sst_target != 0], sst_target[sst_target != 0])
   temp_loss <- nnf_mse_loss(output[[2]], b$y2$to(device = device))
   nino_loss <- nnf_cross_entropy(output[[3]], b$y3$to(device = device))
   
-  if ((i %% 30 == 0)) {
-    
-    print(i)
+  print(i)
+  
+  if ((i %% 20 == 0)) {
     
     print(sst_loss$item())
     print(temp_loss$item())
     print(nino_loss$item())
     
-    print(as.matrix(output[[2]]) * train_sd_nino + train_mean_nino)
-    print(as.matrix(b$y2) * train_sd_nino + train_mean_nino)
-    
+    print(as.numeric(output[[2]]) * train_sd_nino + train_mean_nino)
+    print(as.numeric(b$y2) * train_sd_nino + train_mean_nino)
+
     print(as.matrix(output[[3]]))
-    print(as.matrix(b$y3))
+    print(as.numeric(b$y3))
   }
   
   i <<- i + 1
@@ -310,6 +325,9 @@ for (epoch in 1:num_epochs) {
   # cat(sprintf("\nEpoch %d, validation: loss: %3.3f sst: %3.3f nino: %3.3f \n",
   #             epoch, mean(valid_loss), mean(valid_loss_sst), mean(valid_loss_nino)))
 }
+
+
+# Epoch 16, training: loss: 0.913 sst: 0.859 temp: 0.854 nino: 1.054 
 
 
 
