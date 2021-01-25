@@ -22,6 +22,8 @@ library(ggplot2)
 library(viridis)
 library(ggthemes)
 
+torch_manual_seed(777)
+
 #purrr::walk(readLines("files"), function(f) download.file(url = f, destfile = basename(f)))
 #read_stars("grb/sst189101.grb")
 
@@ -47,8 +49,9 @@ grb <-
 # use 0°–360° E and 55° S–60° N only?
 sst <- grb %>% filter(between(y, -55, 60))
 dim(sst)
+# 360, 115, 1556
 
-sst_train <- grb %>% filter(time < as.Date("2000-01-01"))
+sst_train <- sst %>% filter(time < as.Date("2000-01-01"))
 sst_train <- as.tbl_cube.stars(sst_train)$mets[[1]] 
 sst_train <- sst_train + 273.15
 quantile(sst_train, na.rm = TRUE)
@@ -59,7 +62,7 @@ quantile(sst_train, na.rm = TRUE)
 sst_train[is.na(sst_train)] <- 0
 quantile(sst_train)
   
-sst_valid <- grb %>% filter(time >= as.Date("2000-01-01"))
+sst_valid <- sst %>% filter(time >= as.Date("2000-01-01"))
 sst_valid <- as.tbl_cube.stars(sst_valid)$mets[[1]] 
 sst_valid <- sst_valid + 273.15
 sst_valid <- (sst_valid - train_mean) / train_sd
@@ -79,8 +82,8 @@ nrow(nino)
 nino_train <- nino %>% filter(month < as.Date("2000-01-01"))
 nino_valid <- nino %>% filter(month >= as.Date("2000-01-01"))
 
-nino_train %>% group_by(phase_code, PHASE) %>% summarise(count = n())
-nino_valid %>% group_by(phase_code, PHASE) %>% summarise(count = n())
+nino_train %>% group_by(phase_code, PHASE) %>% summarise(count = n(), avg = mean(NINO34_MEAN))
+nino_valid %>% group_by(phase_code, PHASE) %>% summarise(count = n(), avg = mean(NINO34_MEAN))
 
 
 train_mean_nino <- mean(nino_train$NINO34_MEAN)
@@ -112,12 +115,12 @@ enso_dataset <- dataset(
   },
   
   .getitem = function(i) {
-    x <- torch_tensor(self$sst[ , , i:(n_timesteps + i - 1)]) # (360, 180, n_timesteps)
-    x <- torch_split(x, 1, dim = 3) # list of length n_timesteps of tensors (360, 180, 1)
-    x <- torch_stack(x) # (n_timesteps, 360, 180, 1)
-    x <- x$view(c(n_timesteps, 1, 360, 180))
+    x <- torch_tensor(self$sst[ , , i:(n_timesteps + i - 1)]) # (360, 115, n_timesteps)
+    x <- torch_split(x, 1, dim = 3) # list of length n_timesteps of tensors (360, 115, 1)
+    x <- torch_stack(x) # (n_timesteps, 360, 115, 1)
+    x <- x$view(c(n_timesteps, 1, 360, 115))
     
-    y1 <- torch_tensor(self$sst[ , , n_timesteps + i])$unsqueeze(1) # (1, 360, 180)
+    y1 <- torch_tensor(self$sst[ , , n_timesteps + i])$unsqueeze(1) # (1, 360, 115)
     y2 <- torch_tensor(self$nino$NINO34_MEAN[n_timesteps + i])
     y3 <- torch_tensor(self$nino$phase_code[n_timesteps + i])$squeeze()$to(torch_long())
     list(x = x, y1 = y1, y2 = y2, y3 = y3)
@@ -132,12 +135,12 @@ enso_dataset <- dataset(
 valid_ds <- enso_dataset(sst_valid, nino_valid, n_timesteps)
 length(valid_ds)
 first <- valid_ds$.getitem(1)
-first$x # 6,1,360,180
-first$y1 # 1,360,180
+first$x # 6,1,360,115
+first$y1 # 1,360,115
 first$y2 # 1
 first$y3 # 1
 
-valid_dl <- valid_ds %>% dataloader(batch_size = batch_size)
+valid_dl <- valid_ds %>% dataloader(batch_size = batch_size, drop_last = TRUE)
 length(valid_dl)
 
 iter <- valid_dl$.iter()
@@ -146,8 +149,7 @@ first_batch$y1
 
 train_ds <-enso_dataset(sst_train, nino_train, n_timesteps)
 length(train_ds)
-train_dl <- train_ds %>% dataloader(batch_size = batch_size, shuffle = FALSE)
-### TBD change later!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+train_dl <- train_ds %>% dataloader(batch_size = batch_size, shuffle = TRUE, drop_last = TRUE)
 length(train_dl)
 
 
@@ -168,11 +170,13 @@ model <- nn_module(
                               kernel_sizes = convlstm_kernel,
                               n_layers = convlstm_layers
                               )
-    self$conv1 <- nn_conv2d(in_channels = 1, out_channels = 32, kernel_size = 3, stride = 2)
-    self$conv2 <- nn_conv2d(in_channels = 32, out_channels = 64, kernel_size = 3, stride = 2)
-    self$conv3 <- nn_conv2d(in_channels = 64, out_channels = 1, kernel_size = 3, stride = 2)
+    self$conv1 <- nn_conv2d(in_channels = 32, out_channels = 1, kernel_size = 5, padding = 2)
     
-    self$linear <- nn_linear(44 * 21, 64)
+    self$conv2 <- nn_conv2d(in_channels = 32, out_channels = 32, kernel_size = 5, stride = 2)
+    
+    self$conv3 <- nn_conv2d(in_channels = 32, out_channels = 32, kernel_size = 5, stride = 3)
+ 
+    self$linear <- nn_linear(33408, 64)
     self$cont <- nn_linear(64, 128)
     self$cat <- nn_linear(64, 128)
     self$cont_output <- nn_linear(128, 1)
@@ -182,21 +186,30 @@ model <- nn_module(
   
   forward = function(x) {
     
+    
+    
     ret <- self$convlstm(x)
     layer_last_states <- ret[[2]]
-    #last_layer_output <- ret[[1]][[self$n_layers]]$permute(c(1, 3, 2, 4, 5))
+    last_hidden <- layer_last_states[[self$n_layers]][[1]]
     
-    next_sst <- layer_last_states[[self$n_layers]][[1]]
+    gc()
     
-    filtered_1 <- self$conv1(next_sst) 
-    filtered_2 <- self$conv2(filtered_1)
-    filtered_3 <- self$conv3(filtered_2) 
-   
-    flat <- torch_flatten(filtered_3, start_dim = 2)
+    next_sst <- self$conv1(last_hidden)
+    
+    c2 <- self$conv2(last_hidden)
+    c3 <- self$conv3(c2)
+    
+    flat <- torch_flatten(c3, start_dim = 2)
+    
+    gc()
+    
     common <- self$linear(flat) %>% nnf_relu()
     
     next_temp <- common %>% self$cont() %>% nnf_relu() %>% self$cont_output()
     next_nino <- common %>% self$cat() %>% nnf_relu() %>% self$cat_output()
+    
+    gc()
+    
     list(next_sst, next_temp, next_nino)
     
   }
@@ -204,13 +217,13 @@ model <- nn_module(
 )
 
 device <- torch_device(if(cuda_is_available()) "cuda" else "cpu")
-device <- "cpu"
 
 net <- model(channels_in = 1,
-             convlstm_hidden = c(16, 32, 1),
-             convlstm_kernel = c(3, 5, 1),
+             convlstm_hidden = c(16, 16, 32),
+             convlstm_kernel = c(3, 3, 5),
              convlstm_layers = 3)
 
+net(first_batch$x)
 net <- net$to(device = device)
 net
 
@@ -218,11 +231,11 @@ net
 
 optimizer <- optim_adam(net$parameters, lr = 0.001)
 
-num_epochs <- 50
+num_epochs <- 100
 
-lw_sst <- 0.5
-lw_temp <- 0.5
-lw_nino <- 0
+lw_sst <- 0.2
+lw_temp <- 0.4
+lw_nino <- 0.4
 
 
 train_batch <- function(b) {
@@ -237,19 +250,16 @@ train_batch <- function(b) {
   temp_loss <- nnf_mse_loss(output[[2]], b$y2$to(device = device))
   nino_loss <- nnf_cross_entropy(output[[3]], b$y3$to(device = device))
   
-  print(i)
   
-  if ((i %% 20 == 0)) {
+  if ((i %% 50 == 0)) {
     
-    print(sst_loss$item())
-    print(temp_loss$item())
-    print(nino_loss$item())
-    
-    print(as.numeric(output[[2]]) * train_sd_nino + train_mean_nino)
-    print(as.numeric(b$y2) * train_sd_nino + train_mean_nino)
-
-    print(as.matrix(output[[3]]))
-    print(as.numeric(b$y3))
+    cat("\n")
+    print(round(as.numeric(output[[2]]$to(device = "cpu")) * train_sd_nino + train_mean_nino, 2))
+    print(round(as.numeric(b$y2$to(device = "cpu")) * train_sd_nino + train_mean_nino, 2))
+    cat("\n")
+    print(as.matrix(output[[3]]$to(device = "cpu")))
+    print(as.numeric(b$y3$to(device = "cpu")))
+    cat("\n")
   }
   
   i <<- i + 1
@@ -268,92 +278,110 @@ valid_batch <- function(b) {
 
   output <- net(b$x$to(device = device))
   
-  sst_loss <- nnf_mse_loss(output[[1]], b$y1$to(device = device))
-  nino_loss <- nnf_mse_loss(output[[2]], b$y2$to(device = device))
+  sst_output <- output[[1]]
+  sst_target <- b$y1$to(device = device)
   
-  loss <- sst_loss + nino_loss
+  sst_loss <- nnf_mse_loss(sst_output[sst_target != 0], sst_target[sst_target != 0])
+  temp_loss <- nnf_mse_loss(output[[2]], b$y2$to(device = device))
+  nino_loss <- nnf_cross_entropy(output[[3]], b$y3$to(device = device))
+  
+  
+  if ((j %% 30 == 0)) {
+    
+    cat("\n")
+    print(round(as.numeric(output[[2]]$to(device = "cpu")) * train_sd_nino + train_mean_nino, 2))
+    print(round(as.numeric(b$y2$to(device = "cpu")) * train_sd_nino + train_mean_nino, 2))
+    cat("\n")
+    print(as.matrix(output[[3]]$to(device = "cpu")))
+    print(as.numeric(b$y3$to(device = "cpu")))
+    cat("\n")
+  }
+  
+  j <<- j + 1
+  
+  loss <- lw_sst * sst_loss + lw_temp * temp_loss + lw_nino * nino_loss
 
   gc()
   
-  list(sst_loss$item(), nino_loss$item(), loss$item())
+  list(sst_loss$item(), temp_loss$item(), nino_loss$item(), loss$item())
   
 }
-
-#net <- torch_load("model_5.pt")
-#net$eval()
 
 for (epoch in 1:num_epochs) {
   
   net$train()
+  
   train_loss_sst <- c()
   train_loss_temp <- c()
   train_loss_nino <- c()
   train_loss <- c()
   
   i <<- 1
-
-  for (b in enumerate(valid_dl)) {
-  #for (b in enumerate(train_dl)) {
+  
+  coro::loop(for(b in train_dl) {
     
     losses <- train_batch(b)
     train_loss_sst <- c(train_loss_sst, losses[[1]])
     train_loss_temp <- c(train_loss_temp, losses[[2]])
     train_loss_nino <- c(train_loss_nino, losses[[3]])
     train_loss <- c(train_loss, losses[[4]])
-
-  }
-
+    
+  })
+  
   torch_save(net, paste0("model_", epoch, ".pt"))
 
   cat(sprintf("\nEpoch %d, training: loss: %3.3f sst: %3.3f temp: %3.3f nino: %3.3f \n",
               epoch, mean(train_loss), mean(train_loss_sst), mean(train_loss_temp), mean(train_loss_nino)))
   
-  # net$eval()
-  # valid_loss_sst <- c()
-  # valid_loss_nino <- c()
-  # valid_loss <- c()
-  # 
-  # for (b in enumerate(valid_dl)) {
-  #   
-  #   losses <- valid_batch(b)
-  #   valid_loss_sst <- c(valid_loss_sst, losses[[1]])
-  #   valid_loss_nino <- c(valid_loss_nino, losses[[2]])
-  #   valid_loss <- c(valid_loss, losses[[3]])
-  #   
-  # }
-  # 
-  # cat(sprintf("\nEpoch %d, validation: loss: %3.3f sst: %3.3f nino: %3.3f \n",
-  #             epoch, mean(valid_loss), mean(valid_loss_sst), mean(valid_loss_nino)))
+  net$eval()
+
+  valid_loss_sst <- c()
+  valid_loss_temp <- c()
+  valid_loss_nino <- c()
+  valid_loss <- c()
+
+  j <<- 1
+  
+  coro::loop(for(b in valid_dl) {
+    
+      losses <- valid_batch(b)
+      valid_loss_sst <- c(valid_loss_sst, losses[[1]])
+      valid_loss_temp <- c(valid_loss_temp, losses[[2]])
+      valid_loss_nino <- c(valid_loss_nino, losses[[3]])
+      valid_loss <- c(valid_loss, losses[[4]])
+    
+  })
+
+  cat(sprintf("\nEpoch %d, validation: loss: %3.3f sst: %3.3f temp: %3.3f nino: %3.3f \n",
+              epoch, mean(valid_loss), mean(valid_loss_sst), mean(valid_loss_temp), mean(valid_loss_nino)))
+  
 }
-
-
-# Epoch 16, training: loss: 0.913 sst: 0.859 temp: 0.854 nino: 1.054 
 
 
 
 # get predictions ---------------------------------------------------------
 
-recursive_predict <- function(n_advance) {
-  
-  net$eval()
-  
-  for (b in enumerate(valid_dl)) {
-    
-    loss <- valid_batch(b)
-    valid_loss <- c(valid_loss, loss)
-    
-    input <- b$x
-    target <- b$y
-    
-    for (i in 1:n_advance) {
-      
-      preds <- net()
-      
-    }
-    
-  }
-  
-}
+# recursive_predict <- function(n_advance) {
+#   
+#   net$eval()
+#   
+#   for (b in enumerate(valid_dl)) {
+#     
+#     loss <- valid_batch(b)
+#     valid_loss <- c(valid_loss, loss)
+#     
+#     input <- b$x
+#     target <- b$y
+#     
+#     for (i in 1:n_advance) {
+#       
+#       preds <- net()
+#       
+#     }
+#     
+#   }
+#   
+# }
 
 
 
