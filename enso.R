@@ -127,10 +127,7 @@ enso_dataset <- dataset(
   .getitem = function(i) {
     x <-
       torch_tensor(self$sst[, , i:(n_timesteps + i - 1)]) # (360, 115, n_timesteps)
-    x <-
-      torch_split(x, 1, dim = 3) # list of length n_timesteps of tensors (360, 115, 1)
-    x <- torch_stack(x) # (n_timesteps, 360, 115, 1)
-    x <- x$view(c(n_timesteps, 1, 360, 115))
+    x <- x$permute(c(3,1,2))$unsqueeze(2) # (n_timesteps, 1, 360, 115))
     
     y1 <-
       torch_tensor(self$sst[, , n_timesteps + i])$unsqueeze(1) # (1, 360, 115)
@@ -157,6 +154,7 @@ length(valid_ds)
 
 first <- valid_ds$.getitem(1)
 first$x # 6,1,360,115
+
 first$y1 # 1,360,115
 first$y2 # 1
 first$y3 # 1
