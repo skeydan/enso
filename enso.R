@@ -237,7 +237,7 @@ model <- nn_module(
     layer_last_states <- ret[[2]]
     last_hidden <- layer_last_states[[self$n_layers]][[1]]
     
-    next_sst <- self$conv1(last_hidden)
+    next_sst <- last_hidden %>% self$conv1()
 
     c2 <- last_hidden %>% self$conv2() 
     c3 <- c2 %>% self$conv3() 
@@ -494,8 +494,8 @@ coro::loop(for (b in dl) {
 
   output <- net(b$x$to(device = device))
 
-  pred_index <<- c(pred_index, output[[2]]$to(device = "cpu"))
-  pred_phase <<- rbind(pred_phase, as.matrix(output[[3]]$to(device = "cpu")))
+  pred_index <- c(pred_index, output[[2]]$to(device = "cpu"))
+  pred_phase <- rbind(pred_phase, as.matrix(output[[3]]$to(device = "cpu")))
 
 })
 
